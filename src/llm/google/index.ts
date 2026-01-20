@@ -19,8 +19,25 @@ import {
   mapGenerateContentResultToChatResult,
 } from './utils/common';
 
+// Import OpenAI client for chat completions API
+import { OpenAI as OpenAIClient } from 'openai';
+import type { ChatCompletion, ChatCompletionChunk } from 'openai/resources/chat/completions';
+import {
+  convertBaseMessagesToOpenAIParams,
+  convertOpenAIResponseToChatResult,
+  convertOpenAIStreamChunkToChatGenerationChunk,
+} from './utils/openai_compat';
+
+/**
+ * Custom Google Generative AI client that uses OpenAI-compatible Chat Completion API
+ * instead of the native Google generateContent/generateContentStream endpoints.
+ * 
+ * This allows using Google's Gemini models through their OpenAI-compatible endpoint:
+ * https://generativelanguage.googleapis.com/v1beta/openai/
+ */
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
-  thinkingConfig?: GeminiGenerationConfig['thinkingConfig'];
+  private openaiClient: OpenAIClient;
+  private useOpenAICompatibleAPI: boolean = true;
 
   /**
    * Override to add gemini-3 model support for multimodal and function calling thought signatures
@@ -92,33 +109,18 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       }
     }
 
-    this.thinkingConfig = fields.thinkingConfig ?? this.thinkingConfig;
-
     this.streaming = fields.streaming ?? this.streaming;
     this.json = fields.json;
 
-    // @ts-ignore - Accessing private property from parent class
-    this.client = new GenerativeAI(this.apiKey).getGenerativeModel(
-      {
-        model: this.model,
-        safetySettings: this.safetySettings as SafetySetting[],
-        generationConfig: {
-          stopSequences: this.stopSequences,
-          maxOutputTokens: this.maxOutputTokens,
-          temperature: this.temperature,
-          topP: this.topP,
-          topK: this.topK,
-          ...(this.json != null
-            ? { responseMimeType: 'application/json' }
-            : {}),
-        },
-      },
-      {
-        apiVersion: fields.apiVersion,
-        baseUrl: fields.baseUrl,
-        customHeaders: fields.customHeaders,
-      }
-    );
+    // Initialize OpenAI-compatible client
+    const baseURL = fields.baseUrl || 'https://generativelanguage.googleapis.com/v1beta/openai';
+    
+    this.openaiClient = new OpenAIClient({
+      apiKey: this.apiKey,
+      baseURL: baseURL,
+      defaultHeaders: fields.customHeaders,
+    });
+
     this.streamUsage = fields.streamUsage ?? this.streamUsage;
   }
 
@@ -127,72 +129,31 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   }
 
   /**
-   * Helper function to convert Gemini API usage metadata to LangChain format
-   * Includes support for cached tokens and tier-based tracking for gemini-3-pro-preview
+   * Helper function to convert OpenAI usage metadata to LangChain format
    */
   private _convertToUsageMetadata(
-    usageMetadata: GeminiApiUsageMetadata | undefined,
-    model: string
+    usage: ChatCompletion.Usage | undefined
   ): UsageMetadata | undefined {
-    if (!usageMetadata) {
+    if (!usage) {
       return undefined;
     }
 
     const output: UsageMetadata = {
-      input_tokens: usageMetadata.promptTokenCount ?? 0,
-      output_tokens:
-        (usageMetadata.candidatesTokenCount ?? 0) +
-        (usageMetadata.thoughtsTokenCount ?? 0),
-      total_tokens: usageMetadata.totalTokenCount ?? 0,
+      input_tokens: usage.prompt_tokens ?? 0,
+      output_tokens: usage.completion_tokens ?? 0,
+      total_tokens: usage.total_tokens ?? 0,
     };
 
-    if (usageMetadata.cachedContentTokenCount) {
-      output.input_token_details ??= {};
-      output.input_token_details.cache_read =
-        usageMetadata.cachedContentTokenCount;
-    }
-
-    // gemini-3-pro-preview has bracket based tracking of tokens per request
-    if (model === 'gemini-3-pro-preview') {
-      const over200k = Math.max(
-        0,
-        (usageMetadata.promptTokenCount ?? 0) - 200000
-      );
-      const cachedOver200k = Math.max(
-        0,
-        (usageMetadata.cachedContentTokenCount ?? 0) - 200000
-      );
-      if (over200k) {
-        output.input_token_details = {
-          ...output.input_token_details,
-          over_200k: over200k,
-        } as InputTokenDetails;
-      }
-      if (cachedOver200k) {
-        output.input_token_details = {
-          ...output.input_token_details,
-          cache_read_over_200k: cachedOver200k,
-        } as InputTokenDetails;
+    // Handle cached tokens if present
+    if ('prompt_tokens_details' in usage && usage.prompt_tokens_details) {
+      const details = usage.prompt_tokens_details as any;
+      if (details.cached_tokens) {
+        output.input_token_details ??= {};
+        output.input_token_details.cache_read = details.cached_tokens;
       }
     }
 
     return output;
-  }
-
-  invocationParams(
-    options?: this['ParsedCallOptions']
-  ): Omit<GenerateContentRequest, 'contents'> {
-    const params = super.invocationParams(options);
-    if (this.thinkingConfig) {
-      /** @ts-ignore */
-      this.client.generationConfig = {
-        /** @ts-ignore */
-        ...this.client.generationConfig,
-        /** @ts-ignore */
-        thinkingConfig: this.thinkingConfig,
-      };
-    }
-    return params;
   }
 
   async _generate(
@@ -200,41 +161,34 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<import('@langchain/core/outputs').ChatResult> {
-    const prompt = convertBaseMessagesToContent(
+    const openaiMessages = convertBaseMessagesToOpenAIParams(
       messages,
       this._isMultimodalModel,
-      this.useSystemInstruction,
       this.model
     );
-    let actualPrompt = prompt;
-    if (prompt?.[0].role === 'system') {
-      const [systemInstruction] = prompt;
-      /** @ts-ignore */
-      this.client.systemInstruction = systemInstruction;
-      actualPrompt = prompt.slice(1);
-    }
-    const parameters = this.invocationParams(options);
-    const request = {
-      ...parameters,
-      contents: actualPrompt,
+
+    const requestParams: OpenAIClient.Chat.ChatCompletionCreateParams = {
+      model: this.model,
+      messages: openaiMessages,
+      temperature: this.temperature,
+      top_p: this.topP,
+      max_tokens: this.maxOutputTokens,
+      stop: this.stopSequences,
+      stream: false,
     };
 
-    const res = await this.caller.callWithOptions(
+    // Add response format for JSON mode
+    if (this.json) {
+      requestParams.response_format = { type: 'json_object' };
+    }
+
+    const response = await this.caller.callWithOptions(
       { signal: options.signal },
-      async () =>
-        /** @ts-ignore */
-        this.client.generateContent(request)
-    );
+      async () => this.openaiClient.chat.completions.create(requestParams)
+    ) as ChatCompletion;
 
-    const response = res.response;
-    const usageMetadata = this._convertToUsageMetadata(
-      /** @ts-ignore */
-      response.usageMetadata,
-      this.model
-    );
-
-    /** @ts-ignore */
-    const generationResult = mapGenerateContentResultToChatResult(response, {
+    const usageMetadata = this._convertToUsageMetadata(response.usage);
+    const generationResult = convertOpenAIResponseToChatResult(response, {
       usageMetadata,
     });
 
@@ -246,6 +200,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       undefined,
       undefined
     );
+    
     return generationResult;
   }
 
@@ -254,67 +209,67 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const prompt = convertBaseMessagesToContent(
+    const openaiMessages = convertBaseMessagesToOpenAIParams(
       messages,
       this._isMultimodalModel,
-      this.useSystemInstruction,
       this.model
     );
-    let actualPrompt = prompt;
-    if (prompt?.[0].role === 'system') {
-      const [systemInstruction] = prompt;
-      /** @ts-ignore */
-      this.client.systemInstruction = systemInstruction;
-      actualPrompt = prompt.slice(1);
-    }
-    const parameters = this.invocationParams(options);
-    const request = {
-      ...parameters,
-      contents: actualPrompt,
+
+    const requestParams: OpenAIClient.Chat.ChatCompletionCreateParams = {
+      model: this.model,
+      messages: openaiMessages,
+      temperature: this.temperature,
+      top_p: this.topP,
+      max_tokens: this.maxOutputTokens,
+      stop: this.stopSequences,
+      stream: true,
+      stream_options: this.streamUsage !== false && options.streamUsage !== false 
+        ? { include_usage: true } 
+        : undefined,
     };
+
+    // Add response format for JSON mode
+    if (this.json) {
+      requestParams.response_format = { type: 'json_object' };
+    }
+
     const stream = await this.caller.callWithOptions(
       { signal: options.signal },
-      async () => {
-        /** @ts-ignore */
-        const { stream } = await this.client.generateContentStream(request);
-        return stream;
-      }
+      async () => this.openaiClient.chat.completions.create(requestParams)
     );
 
     let index = 0;
     let lastUsageMetadata: UsageMetadata | undefined;
-    for await (const response of stream) {
-      if (
-        'usageMetadata' in response &&
-        this.streamUsage !== false &&
-        options.streamUsage !== false
-      ) {
-        lastUsageMetadata = this._convertToUsageMetadata(
-          response.usageMetadata as GeminiApiUsageMetadata | undefined,
-          this.model
-        );
+    
+    for await (const chunk of stream as AsyncIterable<ChatCompletionChunk>) {
+      // Extract usage metadata from the final chunk
+      if (chunk.usage) {
+        lastUsageMetadata = this._convertToUsageMetadata(chunk.usage as any);
       }
 
-      const chunk = convertResponseContentToChatGenerationChunk(response, {
+      const generationChunk = convertOpenAIStreamChunkToChatGenerationChunk(chunk, {
         usageMetadata: undefined,
         index,
       });
+      
       index += 1;
-      if (!chunk) {
+      
+      if (!generationChunk) {
         continue;
       }
 
-      yield chunk;
+      yield generationChunk;
       await runManager?.handleLLMNewToken(
-        chunk.text || '',
+        generationChunk.text || '',
         undefined,
         undefined,
         undefined,
         undefined,
-        { chunk }
+        { chunk: generationChunk }
       );
     }
 
+    // Yield final chunk with usage metadata
     if (lastUsageMetadata) {
       const finalChunk = new ChatGenerationChunk({
         text: '',
